@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 
 // ============================================================
 // Generic FLOPs computation
@@ -252,6 +252,43 @@ const fmtTime = (h) => {
   return `${(h / 24).toFixed(2)} days`;
 };
 
+// Recommended MFU% — STANDALONE (non-NVL72) baselines from NVIDIA NeMo
+// Megatron-Bridge at ~256 GPUs, with a modest scale-out penalty applied
+// for larger clusters. Calibrated so that 4K standalone DSV3 / B300 lands at
+// ~10% and DSV3 / H100 / 1024 lands at ~17% (matches NeMo bridge measurements).
+// BF16 and FP8 share one baseline. Returns null for FP4 (kernels maturing).
+const recommendedMfu = (gpuType, precision, ffnType, numGpus = 4096) => {
+  if (precision === 'fp4') return null;
+  const isMoE = ffnType === 'moe';
+
+  // Baselines at ~256 GPUs, standalone (non-NVL72).
+  // Sources: NeMo bridge 26.04 (B200/B300 DSV3 standalone),
+  //          NeMo bridge 0.1.0 (H100 DSV3 / 1024 GPUs at 17.1% MFU).
+  let base;
+  if (gpuType === 'B300') base = isMoE ? 12 : 30;
+  else if (gpuType === 'B200') base = isMoE ? 16 : 38;
+  else base = isMoE ? 18 : 37; // H100 / H200 / H800
+
+  // Scale-out penalty
+  const n = numGpus || 1;
+  let penalty;
+  if (isMoE) {
+    if (n <= 512) penalty = 0;
+    else if (n <= 2048) penalty = 1;       // H100 / 1024 → 17% ✓
+    else if (n <= 8192) penalty = 2;       // 4K-class → B300 DSV3 → 10%
+    else if (n <= 32768) penalty = 4;
+    else penalty = 6;
+  } else {
+    if (n <= 512) penalty = 0;
+    else if (n <= 2048) penalty = 2;
+    else if (n <= 8192) penalty = 4;       // 4K-class
+    else if (n <= 32768) penalty = 6;
+    else penalty = 10;
+  }
+
+  return Math.max(5, base - penalty);
+};
+
 // ============================================================
 // Main Component
 // ============================================================
@@ -282,6 +319,13 @@ export default function Calculator() {
 
   // UI state
   const [activePreset, setActivePreset] = useState('dsv3');
+
+  // Auto-fill MFU% when GPU / precision / FFN type / cluster size changes.
+  // Skips FP4 (kernels still maturing). User-typed values get overwritten on next change.
+  useEffect(() => {
+    const m = recommendedMfu(gpuType, precision, arch.ffn_type, numGpus);
+    if (m != null) setMfu(m);
+  }, [gpuType, precision, arch.ffn_type, numGpus]);
 
   const applyPreset = (key) => {
     setArch({ ...PRESETS[key].cfg });
@@ -749,7 +793,7 @@ export default function Calculator() {
                 <Field label="MFU (%)">
                   <Num value={mfu} onChange={setMfu} step={1} />
                   <Slider value={mfu} onChange={setMfu} min={5} max={70} step={1} />
-                  <MfuRefBox gpuType={gpuType} precision={precision} />
+                  <MfuRefBox gpuType={gpuType} precision={precision} ffnType={arch.ffn_type} numGpus={numGpus} />
                 </Field>
               ) : (
                 <Field label="Global batch size">
@@ -1062,21 +1106,28 @@ function Toggle({ label, hint, value, onChange, inline }) {
   );
 }
 
-function MfuRefBox({ gpuType, precision }) {
-  const refs = [
-    { label: 'DSV3 / B300 / FP8 (NVIDIA MC)', val: '~18%', match: gpuType === 'B300' && precision === 'fp8' },
-    { label: 'DSV3 / B200 / FP8 (NVIDIA MC)', val: '~23%', match: gpuType === 'B200' && precision === 'fp8' },
-  ];
+function MfuRefBox({ gpuType, precision, ffnType, numGpus }) {
+  const isMoE = ffnType === 'moe';
+  const recDense = recommendedMfu(gpuType, precision, 'dense', numGpus);
+  const recMoE = recommendedMfu(gpuType, precision, 'moe', numGpus);
+  const gpuLabel = gpuType;
+  const precLabel = precision.toUpperCase();
+  const scaleNote = numGpus <= 512 ? '~256 GPU baseline' : numGpus <= 2048 ? '~2K cluster' : numGpus <= 8192 ? '~4K cluster' : numGpus <= 32768 ? '~16K cluster' : '64K+ cluster';
+  const title = precision === 'fp4'
+    ? 'FP4 kernels still maturing — auto-fill disabled'
+    : `Auto-filled · ${gpuLabel} / ${precLabel} · ${numGpus.toLocaleString()} GPUs (${scaleNote}) · standalone non-NVL72`;
   return (
     <div style={S.mfuRefBox}>
-      <div style={S.mfuRefTitle}>Reference points</div>
+      <div style={S.mfuRefTitle}>{title}</div>
       <div style={S.mfuRefList}>
-        {refs.map((r, i) => (
-          <div key={i} style={{...S.mfuRefItem, ...(r.match ? S.mfuRefItemMatch : {})}}>
-            <span style={S.mfuRefLabel}>{r.label}</span>
-            <span style={S.mfuRefVal}>{r.val}</span>
-          </div>
-        ))}
+        <div style={{...S.mfuRefItem, ...(!isMoE && recDense != null ? S.mfuRefItemMatch : {})}}>
+          <span style={S.mfuRefLabel}>{gpuLabel} / {precLabel} / Dense</span>
+          <span style={S.mfuRefVal}>{recDense != null ? `${recDense}%` : '—'}</span>
+        </div>
+        <div style={{...S.mfuRefItem, ...(isMoE && recMoE != null ? S.mfuRefItemMatch : {})}}>
+          <span style={S.mfuRefLabel}>{gpuLabel} / {precLabel} / MoE</span>
+          <span style={S.mfuRefVal}>{recMoE != null ? `${recMoE}%` : '—'}</span>
+        </div>
       </div>
     </div>
   );
