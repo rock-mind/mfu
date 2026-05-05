@@ -442,6 +442,12 @@ export default function Calculator() {
                           updates.num_kv_heads = arch.num_attention_heads;
                         } else if (k === 'mqa') {
                           updates.num_kv_heads = 1;
+                        } else if (k === 'gqa') {
+                          const cur = arch.num_kv_heads;
+                          if (cur == null || cur === arch.num_attention_heads || cur === 1) {
+                            const t = Math.min(8, Math.max(2, Math.floor(arch.num_attention_heads / 4)));
+                            updates.num_kv_heads = Math.min(t, arch.num_attention_heads);
+                          }
                         } else if (arch.num_kv_heads == null) {
                           updates.num_kv_heads = arch.num_attention_heads;
                         }
