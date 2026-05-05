@@ -9,7 +9,7 @@ function computeFlopsPerToken(cfg) {
     causal_mfu = true,
     attention_type,
     num_attention_heads: nq, num_kv_heads: nkv, head_dim: dh,
-    sliding_window,
+    sliding_window, full_attn_every_n = 0,
     q_lora_rank, kv_lora_rank,
     qk_nope_head_dim, qk_rope_head_dim, v_head_dim,
     ffn_type,
@@ -33,11 +33,17 @@ function computeFlopsPerToken(cfg) {
     attn_quad = (2*nq*qhd*T + 2*nq*T*v_head_dim) / cd;
   } else {
     attn_lin = 2*d*nq*dh + 2*d*nkv*dh + 2*d*nkv*dh + 2*nq*dh*d;
+    const attn_quad_full = (2*nq*dh*T + 2*nq*T*dh) / cd;
     if (attention_type === 'sliding' && sliding_window && sliding_window < T) {
-      const eff = sliding_window;
-      attn_quad = 2*nq*dh*eff + 2*nq*eff*dh; // sliding is already directional
+      const attn_quad_sliding = 2*nq*dh*sliding_window + 2*nq*sliding_window*dh; // already directional
+      if (full_attn_every_n && full_attn_every_n > 1) {
+        const full_share = 1 / full_attn_every_n;
+        attn_quad = full_share * attn_quad_full + (1 - full_share) * attn_quad_sliding;
+      } else {
+        attn_quad = attn_quad_sliding;
+      }
     } else {
-      attn_quad = (2*nq*dh*T + 2*nq*T*dh) / cd;
+      attn_quad = attn_quad_full;
     }
   }
   const attn = attn_lin + attn_quad;
@@ -386,8 +392,11 @@ export default function Calculator() {
                           updates.num_kv_heads = arch.num_attention_heads;
                         }
                         if (arch.head_dim == null) updates.head_dim = 128;
-                        if (k === 'sliding' && arch.sliding_window == null) {
-                          updates.sliding_window = 4096;
+                        if (k === 'sliding' && (arch.sliding_window == null || arch.sliding_window >= arch.seq_len / 2)) {
+                          updates.sliding_window = Math.max(512, Math.min(4096, Math.floor(arch.seq_len / 4)));
+                        }
+                        if (k === 'sliding' && arch.full_attn_every_n == null) {
+                          updates.full_attn_every_n = 0;
                         }
                       }
                       updateArch(updates);
@@ -442,13 +451,28 @@ export default function Calculator() {
                     </Field>
                   </FieldRow>
                   {arch.attention_type === 'sliding' && (
-                    <Field label="sliding_window (tokens)">
-                      <Num
-                        value={arch.sliding_window ?? 4096}
-                        onChange={(v) => updateArch({sliding_window: v})}
-                        step={1024}
-                      />
-                    </Field>
+                    <FieldRow>
+                      <Field label="sliding_window (tokens)">
+                        <Num
+                          value={arch.sliding_window ?? 4096}
+                          onChange={(v) => updateArch({sliding_window: v})}
+                          step={1024}
+                        />
+                      </Field>
+                      <Field label="full_attn_every_n (0=pure)">
+                        <Num
+                          value={arch.full_attn_every_n ?? 0}
+                          onChange={(v) => updateArch({full_attn_every_n: v})}
+                        />
+                      </Field>
+                    </FieldRow>
+                  )}
+                  {arch.attention_type === 'sliding' && arch.full_attn_every_n > 1 && (
+                    <div style={S.note}>
+                      Hybrid: 1 full-attention layer every {arch.full_attn_every_n} layers
+                      (i.e., {arch.full_attn_every_n - 1}:1 sliding:full ratio).
+                      Set to 0 or 1 for pure sliding.
+                    </div>
                   )}
                   {arch.attention_type === 'mqa' && (
                     <div style={S.note}>
@@ -1006,13 +1030,31 @@ function buildFormulas(a) {
     let attn_qk, attn_pv, qkSym, qkSub, pvSym, pvSub, qGroup;
     if (a.attention_type === 'sliding' && a.sliding_window && a.sliding_window < T) {
       const w = a.sliding_window;
-      attn_qk = 2 * nq * dh * w;
-      attn_pv = 2 * nq * w * dh;
-      qkSym = '2·n_q·head_dim·window';
-      qkSub = `2·${nq}·${dh}·${w}`;
-      pvSym = '2·n_q·window·head_dim';
-      pvSub = `2·${nq}·${w}·${dh}`;
-      qGroup = `Sliding window attention (window=${w}, per layer)`;
+      const n = a.full_attn_every_n;
+      const qk_sliding = 2 * nq * dh * w;
+      const pv_sliding = 2 * nq * w * dh;
+      if (n && n > 1) {
+        const fs = 1 / n;
+        const ss = 1 - fs;
+        const qk_full = (2 * nq * dh * T) / cd;
+        const pv_full = (2 * nq * T * dh) / cd;
+        attn_qk = ss * qk_sliding + fs * qk_full;
+        attn_pv = ss * pv_sliding + fs * pv_full;
+        const ssStr = ss.toFixed(3), fsStr = fs.toFixed(3);
+        qkSym = `${ssStr}·(2·n_q·head_dim·window) + ${fsStr}·(2·n_q·head_dim·seq${cdLabel})`;
+        qkSub = `${ssStr}·(2·${nq}·${dh}·${w}) + ${fsStr}·(2·${nq}·${dh}·${T}${cdLabel})`;
+        pvSym = `${ssStr}·(2·n_q·window·head_dim) + ${fsStr}·(2·n_q·seq·head_dim${cdLabel})`;
+        pvSub = `${ssStr}·(2·${nq}·${w}·${dh}) + ${fsStr}·(2·${nq}·${T}·${dh}${cdLabel})`;
+        qGroup = `Hybrid attention (window=${w}, 1 full per ${n} layers, per-layer avg)`;
+      } else {
+        attn_qk = qk_sliding;
+        attn_pv = pv_sliding;
+        qkSym = '2·n_q·head_dim·window';
+        qkSub = `2·${nq}·${dh}·${w}`;
+        pvSym = '2·n_q·window·head_dim';
+        pvSub = `2·${nq}·${w}·${dh}`;
+        qGroup = `Sliding window attention (window=${w}, per layer)`;
+      }
     } else {
       attn_qk = (2 * nq * dh * T) / cd;
       attn_pv = (2 * nq * T * dh) / cd;
