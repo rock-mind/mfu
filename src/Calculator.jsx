@@ -369,7 +369,29 @@ export default function Calculator() {
                 ].map(({k, label, hint}) => (
                   <button
                     key={k}
-                    onClick={() => updateArch({attention_type: k})}
+                    onClick={() => {
+                      const updates = {attention_type: k};
+                      if (k === 'mla') {
+                        if (arch.q_lora_rank == null) updates.q_lora_rank = 1536;
+                        if (arch.kv_lora_rank == null) updates.kv_lora_rank = 512;
+                        if (arch.qk_nope_head_dim == null) updates.qk_nope_head_dim = 128;
+                        if (arch.qk_rope_head_dim == null) updates.qk_rope_head_dim = 64;
+                        if (arch.v_head_dim == null) updates.v_head_dim = 128;
+                      } else {
+                        if (k === 'mha') {
+                          updates.num_kv_heads = arch.num_attention_heads;
+                        } else if (k === 'mqa') {
+                          updates.num_kv_heads = 1;
+                        } else if (arch.num_kv_heads == null) {
+                          updates.num_kv_heads = arch.num_attention_heads;
+                        }
+                        if (arch.head_dim == null) updates.head_dim = 128;
+                        if (k === 'sliding' && arch.sliding_window == null) {
+                          updates.sliding_window = 4096;
+                        }
+                      }
+                      updateArch(updates);
+                    }}
                     style={{...S.seg, ...(arch.attention_type === k ? S.segActive : {})}}
                   >
                     <div style={S.segLabel}>{label}</div>
@@ -447,7 +469,15 @@ export default function Calculator() {
                   <div style={S.segHint}>SwiGLU</div>
                 </button>
                 <button
-                  onClick={() => updateArch({ffn_type: 'moe'})}
+                  onClick={() => {
+                    const updates = {ffn_type: 'moe'};
+                    if (arch.moe_intermediate_size == null) updates.moe_intermediate_size = 2048;
+                    if (arch.n_routed_experts == null) updates.n_routed_experts = 256;
+                    if (arch.n_shared_experts == null) updates.n_shared_experts = 1;
+                    if (arch.num_experts_per_tok == null) updates.num_experts_per_tok = 8;
+                    if (arch.first_k_dense_replace == null) updates.first_k_dense_replace = 0;
+                    updateArch(updates);
+                  }}
                   style={{...S.seg, ...(arch.ffn_type === 'moe' ? S.segActive : {})}}
                 >
                   <div style={S.segLabel}>MoE</div>
@@ -490,7 +520,11 @@ export default function Calculator() {
                 label="Enable MTP"
                 hint="Adds an extra transformer block + linear projection [2d→d] + LM head per MTP layer"
                 value={arch.mtp_enabled}
-                onChange={(v) => updateArch({mtp_enabled: v})}
+                onChange={(v) => {
+                  const updates = {mtp_enabled: v};
+                  if (v && arch.num_mtp_layers == null) updates.num_mtp_layers = 1;
+                  updateArch(updates);
+                }}
               />
               {arch.mtp_enabled && (
                 <Field label="Number of MTP layers">
