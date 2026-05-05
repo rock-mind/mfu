@@ -10,6 +10,9 @@ function computeFlopsPerToken(cfg) {
     attention_type,
     num_attention_heads: nq, num_kv_heads: nkv, head_dim: dh,
     sliding_window, full_attn_every_n = 0,
+    linear_num_key_heads: lnk, linear_num_value_heads: lnv,
+    linear_key_head_dim: ldqk, linear_value_head_dim: ldv,
+    linear_conv_kernel_dim: lck = 4,
     q_lora_rank, kv_lora_rank,
     qk_nope_head_dim, qk_rope_head_dim, v_head_dim,
     ffn_type,
@@ -31,6 +34,27 @@ function computeFlopsPerToken(cfg) {
              + 2*kv_lora_rank*nq*(qk_nope_head_dim + v_head_dim)
              + 2*nq*v_head_dim*d;
     attn_quad = (2*nq*qhd*T + 2*nq*T*v_head_dim) / cd;
+  } else if (attention_type === 'linear_hybrid') {
+    // Hybrid: linear attention layers interleaved with full attention layers.
+    // full_attn_every_n controls the period: 1 full per N layers (e.g., 4 = 3:1 linear:full).
+    const full_attn_lin = 2*d*nq*dh + 2*d*nkv*dh + 2*d*nkv*dh + 2*nq*dh*d;
+    const full_attn_quad = (2*nq*dh*T + 2*nq*T*dh) / cd;
+    // Linear attention per-layer per-token (gated linear / Mamba-style approximation).
+    // Q has same head count as V output, dim = key_head_dim.
+    const lin_q_proj = 2*d*lnv*ldqk;
+    const lin_k_proj = 2*d*lnk*ldqk;
+    const lin_v_proj = 2*d*lnv*ldv;
+    const lin_o_proj = 2*lnv*ldv*d;
+    const lin_conv = 2*lck*(lnv*ldqk + lnk*ldqk);
+    const lin_state = 2*lnk*ldqk*ldv;
+    const lin_query = 2*lnv*ldqk*ldv;
+    const lin_proj_total = lin_q_proj + lin_k_proj + lin_v_proj + lin_o_proj + lin_conv;
+    const lin_attn_total = lin_state + lin_query;
+    const n = full_attn_every_n && full_attn_every_n > 0 ? full_attn_every_n : 1;
+    const full_share = 1 / n;
+    const linear_share = 1 - full_share;
+    attn_lin = full_share * full_attn_lin + linear_share * lin_proj_total;
+    attn_quad = full_share * full_attn_quad + linear_share * lin_attn_total;
   } else {
     attn_lin = 2*d*nq*dh + 2*d*nkv*dh + 2*d*nkv*dh + 2*nq*dh*d;
     const attn_quad_full = (2*nq*dh*T + 2*nq*T*dh) / cd;
@@ -154,14 +178,36 @@ const PRESETS = {
       mtp_enabled: false,
     },
   },
-  'mistral-7b': {
-    label: 'Mistral 7B (Sliding Window)',
+  'qwen3.5-397b': {
+    label: 'Qwen3.5-397B-A17B (Linear+Full Hybrid MoE)',
     cfg: {
-      hidden_size: 4096, num_hidden_layers: 32, vocab_size: 32000, seq_len: 8192,
-      attention_type: 'sliding',
-      num_attention_heads: 32, num_kv_heads: 8, head_dim: 128, sliding_window: 4096,
-      ffn_type: 'dense', intermediate_size: 14336,
-      mtp_enabled: false,
+      hidden_size: 4096, num_hidden_layers: 60, vocab_size: 248320, seq_len: 4096,
+      attention_type: 'linear_hybrid',
+      num_attention_heads: 32, num_kv_heads: 2, head_dim: 256,
+      full_attn_every_n: 4,
+      linear_num_key_heads: 16, linear_num_value_heads: 64,
+      linear_key_head_dim: 128, linear_value_head_dim: 128, linear_conv_kernel_dim: 4,
+      ffn_type: 'moe',
+      intermediate_size: 1024, first_k_dense_replace: 0,
+      moe_intermediate_size: 1024,
+      n_routed_experts: 512, n_shared_experts: 1, num_experts_per_tok: 10,
+      mtp_enabled: true, num_mtp_layers: 1,
+    },
+  },
+  'qwen3.5-35b': {
+    label: 'Qwen3.5-35B-A3B (Linear+Full Hybrid MoE)',
+    cfg: {
+      hidden_size: 2048, num_hidden_layers: 40, vocab_size: 248320, seq_len: 4096,
+      attention_type: 'linear_hybrid',
+      num_attention_heads: 16, num_kv_heads: 2, head_dim: 256,
+      full_attn_every_n: 4,
+      linear_num_key_heads: 16, linear_num_value_heads: 32,
+      linear_key_head_dim: 128, linear_value_head_dim: 128, linear_conv_kernel_dim: 4,
+      ffn_type: 'moe',
+      intermediate_size: 512, first_k_dense_replace: 0,
+      moe_intermediate_size: 512,
+      n_routed_experts: 256, n_shared_experts: 1, num_experts_per_tok: 8,
+      mtp_enabled: true, num_mtp_layers: 1,
     },
   },
   'qwen2.5-72b': {
@@ -203,9 +249,7 @@ const fmtTime = (h) => {
   if (h < 1/60) return `${(h*3600).toFixed(0)} sec`;
   if (h < 1) return `${(h * 60).toFixed(1)} min`;
   if (h < 24) return `${h.toFixed(2)} hr`;
-  const d = h / 24;
-  if (d < 30) return `${d.toFixed(2)} days`;
-  return `${(d / 30).toFixed(2)} mo (${d.toFixed(0)}d)`;
+  return `${(h / 24).toFixed(2)} days`;
 };
 
 // ============================================================
@@ -226,7 +270,7 @@ export default function Calculator() {
   const [recompute, setRecompute] = useState(false);
 
   // Estimate-mode-specific
-  const [tokens, setTokens] = useState(25);
+  const [tokens, setTokens] = useState(30);
   const [mfu, setMfu] = useState(18);
   const [costPerHour, setCostPerHour] = useState(6.80);
 
@@ -372,6 +416,7 @@ export default function Calculator() {
                   {k: 'mqa', label: 'MQA', hint: 'Multi-Query'},
                   {k: 'sliding', label: 'Sliding', hint: 'Sliding Window'},
                   {k: 'mla', label: 'MLA', hint: 'Multi-head Latent'},
+                  {k: 'linear_hybrid', label: 'L-Hybrid', hint: 'Linear+Full'},
                 ].map(({k, label, hint}) => (
                   <button
                     key={k}
@@ -383,6 +428,15 @@ export default function Calculator() {
                         if (arch.qk_nope_head_dim == null) updates.qk_nope_head_dim = 128;
                         if (arch.qk_rope_head_dim == null) updates.qk_rope_head_dim = 64;
                         if (arch.v_head_dim == null) updates.v_head_dim = 128;
+                      } else if (k === 'linear_hybrid') {
+                        if (arch.num_kv_heads == null) updates.num_kv_heads = 2;
+                        if (arch.head_dim == null) updates.head_dim = 256;
+                        if (arch.full_attn_every_n == null || arch.full_attn_every_n < 2) updates.full_attn_every_n = 4;
+                        if (arch.linear_num_key_heads == null) updates.linear_num_key_heads = 16;
+                        if (arch.linear_num_value_heads == null) updates.linear_num_value_heads = 32;
+                        if (arch.linear_key_head_dim == null) updates.linear_key_head_dim = 128;
+                        if (arch.linear_value_head_dim == null) updates.linear_value_head_dim = 128;
+                        if (arch.linear_conv_kernel_dim == null) updates.linear_conv_kernel_dim = 4;
                       } else {
                         if (k === 'mha') {
                           updates.num_kv_heads = arch.num_attention_heads;
@@ -396,7 +450,7 @@ export default function Calculator() {
                           updates.sliding_window = Math.max(512, Math.min(4096, Math.floor(arch.seq_len / 4)));
                         }
                         if (k === 'sliding' && arch.full_attn_every_n == null) {
-                          updates.full_attn_every_n = 0;
+                          updates.full_attn_every_n = 4;
                         }
                       }
                       updateArch(updates);
@@ -433,6 +487,74 @@ export default function Calculator() {
                     </Field>
                   </FieldRow>
                 </div>
+              ) : arch.attention_type === 'linear_hybrid' ? (
+                <>
+                  <div style={S.subSection}>
+                    <div style={S.subTitle}>Full-attention layer parameters</div>
+                    <FieldRow>
+                      <Field label="num_attention_heads">
+                        <Num value={arch.num_attention_heads} onChange={(v) => updateArch({num_attention_heads: v})} />
+                      </Field>
+                      <Field label="num_kv_heads">
+                        <Num
+                          value={arch.num_kv_heads ?? arch.num_attention_heads}
+                          onChange={(v) => updateArch({num_kv_heads: v})}
+                        />
+                      </Field>
+                      <Field label="head_dim">
+                        <Num value={arch.head_dim ?? 128} onChange={(v) => updateArch({head_dim: v})} />
+                      </Field>
+                    </FieldRow>
+                    <Field label="full_attn_every_n (1 full per N layers)">
+                      <Num
+                        value={arch.full_attn_every_n ?? 4}
+                        onChange={(v) => updateArch({full_attn_every_n: v})}
+                      />
+                    </Field>
+                  </div>
+                  <div style={S.subSection}>
+                    <div style={S.subTitle}>Linear-attention layer parameters</div>
+                    <FieldRow>
+                      <Field label="linear_num_key_heads">
+                        <Num
+                          value={arch.linear_num_key_heads ?? 16}
+                          onChange={(v) => updateArch({linear_num_key_heads: v})}
+                        />
+                      </Field>
+                      <Field label="linear_num_value_heads">
+                        <Num
+                          value={arch.linear_num_value_heads ?? 32}
+                          onChange={(v) => updateArch({linear_num_value_heads: v})}
+                        />
+                      </Field>
+                    </FieldRow>
+                    <FieldRow>
+                      <Field label="linear_key_head_dim">
+                        <Num
+                          value={arch.linear_key_head_dim ?? 128}
+                          onChange={(v) => updateArch({linear_key_head_dim: v})}
+                        />
+                      </Field>
+                      <Field label="linear_value_head_dim">
+                        <Num
+                          value={arch.linear_value_head_dim ?? 128}
+                          onChange={(v) => updateArch({linear_value_head_dim: v})}
+                        />
+                      </Field>
+                      <Field label="linear_conv_kernel_dim">
+                        <Num
+                          value={arch.linear_conv_kernel_dim ?? 4}
+                          onChange={(v) => updateArch({linear_conv_kernel_dim: v})}
+                        />
+                      </Field>
+                    </FieldRow>
+                    <div style={S.note}>
+                      Linear attention approximated as Q/K/V projections + depthwise conv +
+                      state update (K^T·V outer product) + query application (Q·state) per token.
+                      Linear FLOPs scale O(d²) per token vs full attention's O(N·d).
+                    </div>
+                  </div>
+                </>
               ) : (
                 <div style={S.subSection}>
                   <div style={S.subTitle}>Attention parameters</div>
@@ -461,7 +583,7 @@ export default function Calculator() {
                       </Field>
                       <Field label="full_attn_every_n (0=pure)">
                         <Num
-                          value={arch.full_attn_every_n ?? 0}
+                          value={arch.full_attn_every_n ?? 4}
                           onChange={(v) => updateArch({full_attn_every_n: v})}
                         />
                       </Field>
@@ -755,18 +877,19 @@ function Header() {
   return (
     <header style={S.header}>
       <div style={S.tagRow}>
-        <span style={S.tagAccent}>v2.1</span>
-        <span style={S.tagDim}>LLM training calculator · Estimate or measure MFU</span>
+        <span style={S.tagAccent}>Vol. 2 · Issue 1</span>
+        <span style={S.tagDivider}>—</span>
+        <span style={S.tagDim}>An LLM training-time &amp; MFU calculator</span>
       </div>
       <h1 style={S.title}>
-        Training Time
+        Training&#8202;Time
         <span style={S.titleAccent}>Estimator</span>
       </h1>
       <p style={S.subtitle}>
-        Estimate pre-training wall-clock for any transformer architecture, or
-        reverse-engineer the MFU you're actually achieving from a measured step time.
-        Supports MLA / MHA / GQA / MQA / Sliding Window attention, dense or MoE FFN,
-        with optional Multi-Token Prediction.
+        A first-order calculator for transformer pre-training wall-clock — or, in the
+        inverse direction, for the MFU implied by a measured step time. Supports
+        <em> MHA, GQA, MQA, MLA, Sliding-window</em> and <em>Linear+Full hybrid</em> attention,
+        dense and mixture-of-experts FFN, and optional multi-token prediction.
       </p>
     </header>
   );
@@ -983,7 +1106,44 @@ function buildFormulas(a) {
   const formulas = [];
 
   // ---- Attention linears + quadratic ----
-  if (a.attention_type === 'mla') {
+  if (a.attention_type === 'linear_hybrid') {
+    const nq = a.num_attention_heads;
+    const nkv = a.num_kv_heads ?? nq;
+    const dh = a.head_dim ?? 128;
+    const lnk = a.linear_num_key_heads ?? 16;
+    const lnv = a.linear_num_value_heads ?? 32;
+    const ldqk = a.linear_key_head_dim ?? 128;
+    const ldv = a.linear_value_head_dim ?? 128;
+    const lck = a.linear_conv_kernel_dim ?? 4;
+    const n = a.full_attn_every_n && a.full_attn_every_n > 0 ? a.full_attn_every_n : 1;
+    const fs = 1 / n;
+    const ss = 1 - fs;
+
+    formulas.push({
+      group: `Full-attention layer (1 per ${n} layers, weight=${fs.toFixed(3)})`,
+      items: [
+        { name: 'Q proj',    sym: '2·d·n_q·head_dim',  sub: `2·${d}·${nq}·${dh}`,  val: 2*d*nq*dh },
+        { name: 'K proj',    sym: '2·d·n_kv·head_dim', sub: `2·${d}·${nkv}·${dh}`, val: 2*d*nkv*dh },
+        { name: 'V proj',    sym: '2·d·n_kv·head_dim', sub: `2·${d}·${nkv}·${dh}`, val: 2*d*nkv*dh },
+        { name: 'O proj',    sym: '2·n_q·head_dim·d',  sub: `2·${nq}·${dh}·${d}`,  val: 2*nq*dh*d },
+        { name: 'QKᵀ',       sym: `2·n_q·head_dim·seq${cdLabel}`, sub: `2·${nq}·${dh}·${T}${cdLabel}`, val: (2*nq*dh*T)/cd },
+        { name: 'AV',        sym: `2·n_q·seq·head_dim${cdLabel}`, sub: `2·${nq}·${T}·${dh}${cdLabel}`, val: (2*nq*T*dh)/cd },
+      ],
+    });
+
+    formulas.push({
+      group: `Linear-attention layer (${n - 1} per ${n} layers, weight=${ss.toFixed(3)})`,
+      items: [
+        { name: 'Q proj',    sym: '2·d·n_v·d_qk',  sub: `2·${d}·${lnv}·${ldqk}`, val: 2*d*lnv*ldqk },
+        { name: 'K proj',    sym: '2·d·n_k·d_qk',  sub: `2·${d}·${lnk}·${ldqk}`, val: 2*d*lnk*ldqk },
+        { name: 'V proj',    sym: '2·d·n_v·d_v',   sub: `2·${d}·${lnv}·${ldv}`,  val: 2*d*lnv*ldv },
+        { name: 'O proj',    sym: '2·n_v·d_v·d',   sub: `2·${lnv}·${ldv}·${d}`,  val: 2*lnv*ldv*d },
+        { name: 'Conv (Q,K)',sym: '2·k·(n_v+n_k)·d_qk', sub: `2·${lck}·${lnv + lnk}·${ldqk}`, val: 2*lck*(lnv*ldqk + lnk*ldqk) },
+        { name: 'KᵀV state', sym: '2·n_k·d_qk·d_v', sub: `2·${lnk}·${ldqk}·${ldv}`, val: 2*lnk*ldqk*ldv },
+        { name: 'Q·state',   sym: '2·n_v·d_qk·d_v', sub: `2·${lnv}·${ldqk}·${ldv}`, val: 2*lnv*ldqk*ldv },
+      ],
+    });
+  } else if (a.attention_type === 'mla') {
     const qhd = a.qk_nope_head_dim + a.qk_rope_head_dim;
     const q_a = 2 * d * a.q_lora_rank;
     const q_b = 2 * a.q_lora_rank * a.num_attention_heads * qhd;
@@ -1132,6 +1292,7 @@ function buildFormulas(a) {
 
 
 function Breakdown({ breakdown: b, fwd, arch }) {
+  const [showFormulas, setShowFormulas] = useState(true);
   const items = [];
   if (b.dense_layers_total) items.push({label: `${arch.ffn_type === 'moe' ? arch.first_k_dense_replace : arch.num_hidden_layers} dense layers`, val: b.dense_layers_total});
   if (b.moe_layers_total) items.push({label: `${arch.num_hidden_layers - arch.first_k_dense_replace} MoE layers`, val: b.moe_layers_total});
@@ -1162,35 +1323,47 @@ function Breakdown({ breakdown: b, fwd, arch }) {
       ))}
 
       <div style={S.formulaSection}>
-        <div style={S.subTitle}>Per-component formulas</div>
-        {formulas.map((g, gi) => (
-          <div key={gi} style={S.formulaGroup}>
-            <div style={S.formulaGroupTitle}>{g.group}</div>
-            {g.items.map((it, ii) => (
-              <div key={ii} style={S.formulaRow}>
-                <span style={S.formulaName}>{it.name}</span>
-                <span style={S.formulaBody}>
-                  <span style={S.formulaSym}>{it.sym}</span>
-                  {it.val > 0 && (
-                    <>
-                      <span style={S.formulaEq}>=</span>
-                      <span style={S.formulaSub}>{it.sub}</span>
-                      <span style={S.formulaEq}>=</span>
-                      <span style={S.formulaVal}>{fmt(it.val, 2)}</span>
-                    </>
-                  )}
-                  {it.val === 0 && (
-                    <span style={S.formulaNote}>{it.sub}</span>
-                  )}
-                </span>
+        <button
+          onClick={() => setShowFormulas((v) => !v)}
+          style={S.formulaToggle}
+          aria-expanded={showFormulas}
+        >
+          <span style={{...S.formulaCaret, transform: showFormulas ? 'rotate(90deg)' : 'rotate(0deg)'}}>▶</span>
+          <span style={S.subTitle}>Per-component formulas</span>
+          <span style={S.formulaToggleHint}>{showFormulas ? 'click to collapse' : 'click to expand'}</span>
+        </button>
+        {showFormulas && (
+          <>
+            {formulas.map((g, gi) => (
+              <div key={gi} style={S.formulaGroup}>
+                <div style={S.formulaGroupTitle}>{g.group}</div>
+                {g.items.map((it, ii) => (
+                  <div key={ii} style={S.formulaRow}>
+                    <span style={S.formulaName}>{it.name}</span>
+                    <span style={S.formulaBody}>
+                      <span style={S.formulaSym}>{it.sym}</span>
+                      {it.val > 0 && (
+                        <>
+                          <span style={S.formulaEq}>=</span>
+                          <span style={S.formulaSub}>{it.sub}</span>
+                          <span style={S.formulaEq}>=</span>
+                          <span style={S.formulaVal}>{fmt(it.val, 2)}</span>
+                        </>
+                      )}
+                      {it.val === 0 && (
+                        <span style={S.formulaNote}>{it.sub}</span>
+                      )}
+                    </span>
+                  </div>
+                ))}
               </div>
             ))}
-          </div>
-        ))}
-        <div style={S.formulaLegend}>
-          d = hidden_size · n_h = num_attention_heads · n_q / n_kv = query/kv heads · seq = sequence length
-          {arch.causal_mfu !== false ? ' · "/2" = causal halving' : ''}
-        </div>
+            <div style={S.formulaLegend}>
+              d = hidden_size · n_h = num_attention_heads · n_q / n_kv = query/kv heads · seq = sequence length
+              {arch.causal_mfu !== false ? ' · "/2" = causal halving' : ''}
+            </div>
+          </>
+        )}
       </div>
     </div>
   );
@@ -1201,71 +1374,94 @@ function Methodology() {
     <section style={S.method}>
       <div style={S.panelHead}>
         <span style={S.panelNum}>04</span>
-        <h2 style={S.panelTitle}>Methodology & references</h2>
+        <h2 style={S.panelTitle}>Methodology</h2>
       </div>
-      <div style={S.methodGrid}>
-        <div style={S.methodCol}>
-          <h3 style={S.methodTitle}>FLOPs accounting</h3>
-          <ul style={S.bullets}>
-            <li>Per matmul: <code style={S.code}>2·M·K·N</code></li>
-            <li>Backward = 2× forward → train = 3× forward</li>
-            <li>Activation recompute: 4× forward</li>
-            <li>Causal MFU halves attention quadratic FLOPs</li>
-            <li>SwiGLU FFN: 3 matmuls (gate / up / down) → <code style={S.code}>6·d·inter</code></li>
-            <li>MoE counts only activated experts (top-k routed + shared)</li>
-            <li>MLA: kv_b uses <code style={S.code}>(qk_nope+v_head)</code>, NOT including rope</li>
-            <li>MTP: 1 transformer block + linear <code style={S.code}>[2d→d]</code> + LM head per layer</li>
-          </ul>
-        </div>
+      <div style={S.methodBody}>
+        <div style={S.methodGrid}>
+          <div style={S.methodCol}>
+            <h3 style={S.methodTitle}>FLOPs accounting</h3>
+            <ul style={S.bullets}>
+              <li>Per matmul of shape <code style={S.code}>(M, K) × (K, N)</code>: <code style={S.code}>2·M·K·N</code> flops.</li>
+              <li>Backward ≈ 2× forward; therefore one training step ≈ <strong>3×</strong> forward (or <strong>4×</strong> with full activation recompute).</li>
+              <li>Causal masking halves the attention quadratic, expressed as <code style={S.code}>/2</code>.</li>
+              <li>SwiGLU FFN: three matmuls (gate / up / down) → <code style={S.code}>6·d·d_inter</code>.</li>
+              <li>Mixture-of-experts counts only the activated experts: <code style={S.code}>(top_k + n_shared) · 6·d·d_moe</code>; router cost is <code style={S.code}>2·d·n_routed</code>.</li>
+              <li>MLA: <code style={S.code}>kv_b</code> projection uses <code style={S.code}>(qk_nope + v_head)</code>, excluding RoPE.</li>
+              <li>Multi-token prediction (MTP): one extra transformer block, a <code style={S.code}>[2d → d]</code> projection, and an additional LM head per MTP layer.</li>
+            </ul>
+          </div>
 
-        <div style={S.methodCol}>
-          <h3 style={S.methodTitle}>GPU peak (per-GPU dense, TFLOPS)</h3>
-          <table style={S.table}>
-            <thead>
-              <tr><th style={S.th}>GPU</th><th style={S.th}>BF16</th><th style={S.th}>FP8</th><th style={S.th}>FP4</th><th style={S.th}>HBM</th></tr>
-            </thead>
-            <tbody>
-              {Object.entries(GPUS).map(([k, g]) => (
-                <tr key={k}>
-                  <td style={S.td}>{k}</td>
-                  <td style={S.td}>{g.bf16.toLocaleString()}</td>
-                  <td style={S.td}>{g.fp8.toLocaleString()}</td>
-                  <td style={S.td}>{g.fp4 ? g.fp4.toLocaleString() : '—'}</td>
-                  <td style={S.td}>{g.hbm}GB</td>
+          <div style={S.methodCol}>
+            <h3 style={S.methodTitle}>Supported attention variants</h3>
+            <dl style={S.dl}>
+              <dt style={S.dt}>MHA</dt>
+              <dd style={S.dd}>Multi-head attention; <code style={S.code}>n_kv = n_q</code>.</dd>
+              <dt style={S.dt}>GQA</dt>
+              <dd style={S.dd}>Grouped-query attention; <code style={S.code}>1 &lt; n_kv &lt; n_q</code>.</dd>
+              <dt style={S.dt}>MQA</dt>
+              <dd style={S.dd}>Multi-query attention; <code style={S.code}>n_kv = 1</code>.</dd>
+              <dt style={S.dt}>MLA</dt>
+              <dd style={S.dd}>Multi-head latent attention (DeepSeek-V2/V3): low-rank Q and KV projections via <code style={S.code}>q_lora_rank</code> and <code style={S.code}>kv_lora_rank</code>.</dd>
+              <dt style={S.dt}>Sliding</dt>
+              <dd style={S.dd}>Sliding-window attention (Mistral/Gemma/Llama 4 family); optionally hybridised with full attention via <code style={S.code}>full_attn_every_n</code>.</dd>
+              <dt style={S.dt}>L-Hybrid</dt>
+              <dd style={S.dd}>Linear-attention layers (gated linear / state-space style) interleaved with full-attention layers (Qwen3.5 family). Linear layers approximated as Q/K/V projections, depthwise convolution on Q/K, plus state update <code style={S.code}>K<sup>⊤</sup>V</code> and query application <code style={S.code}>Q·S</code>.</dd>
+            </dl>
+          </div>
+
+          <div style={S.methodCol}>
+            <h3 style={S.methodTitle}>GPU peak — per-GPU dense, TFLOPS</h3>
+            <table style={S.table}>
+              <thead>
+                <tr>
+                  <th style={S.th}>GPU</th>
+                  <th style={S.thNum}>BF16</th>
+                  <th style={S.thNum}>FP8</th>
+                  <th style={S.thNum}>FP4</th>
+                  <th style={S.thNum}>HBM</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {Object.entries(GPUS).map(([k, g]) => (
+                  <tr key={k}>
+                    <td style={S.td}>{k}</td>
+                    <td style={S.tdNum}>{g.bf16.toLocaleString()}</td>
+                    <td style={S.tdNum}>{g.fp8.toLocaleString()}</td>
+                    <td style={S.tdNum}>{g.fp4 ? g.fp4.toLocaleString() : '—'}</td>
+                    <td style={S.tdNum}>{g.hbm} GB</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <p style={S.methodNote}>
+              Dense (non-sparse) tensor-core peak as reported by NVIDIA datasheets. Sparsity-2:4 doubles these figures but is rarely realised in training.
+            </p>
+          </div>
+
+          <div style={S.methodCol}>
+            <h3 style={S.methodTitle}>Reference MFU points</h3>
+            <table style={S.table}>
+              <thead>
+                <tr><th style={S.th}>Setup</th><th style={S.thNum}>MFU</th></tr>
+              </thead>
+              <tbody>
+                <tr><td style={S.td}>DSV3 / GB200 / FP8</td><td style={S.tdNum}>~23%</td></tr>
+                <tr><td style={S.td}>DSV3 / GB300 / FP8</td><td style={S.tdNum}>~18%</td></tr>
+              </tbody>
+            </table>
+            <p style={S.methodNote}>
+              Reported in NVIDIA's Megatron-Core production training note. GB300 reaches 1,233 TFLOPS/GPU and GB200 reaches 1,048 TFLOPS/GPU on DeepSeek-V3-685B; GB300's lower MFU reflects a 56% peak-compute increase outpacing HBM and NVLink bandwidth — wall-clock is still ~17.6% faster.
+            </p>
+          </div>
         </div>
 
-        <div style={S.methodCol}>
-          <h3 style={S.methodTitle}>MFU references (real measurements)</h3>
-          <table style={S.table}>
-            <thead>
-              <tr><th style={S.th}>Setup</th><th style={S.th}>MFU</th></tr>
-            </thead>
-            <tbody>
-              <tr><td style={S.td}>DSV3 / GB200 / FP8</td><td style={S.td}>~23%</td></tr>
-              <tr><td style={S.td}>DSV3 / GB300 / FP8</td><td style={S.td}>~18%</td></tr>
-            </tbody>
-          </table>
-          <p style={S.methodNote}>
-            Source: NVIDIA Megatron-Core paper (2026/03). GB300 achieves 1,233 TFLOPS/GPU
-            and GB200 achieves 1,048 TFLOPS/GPU on DeepSeek-V3-685B training.
-            B300's lower MFU% reflects the 56% peak compute increase outpacing HBM/NVLink
-            bandwidth (both unchanged from B200) — wall-clock is still ~17.6% faster.
-          </p>
-        </div>
-
-        <div style={S.methodCol}>
+        <div style={S.methodFull}>
           <h3 style={S.methodTitle}>Real-world overhead</h3>
           <p style={S.bodyText}>
-            This calculator gives a first-order estimate. Real training adds 10–30% overhead from:
-            comm bottlenecks (TP/PP/EP/DP), straggler & failure rate, checkpoint cost,
-            MoE load imbalance, FP8 kernel maturity. For RL workloads, overhead is typically higher
-            due to rollout-train alternation. Treat the result as an optimistic floor.
+            This calculator yields a first-order, idealised estimate. Production training typically incurs a further <strong>10–30%</strong> overhead from communication bottlenecks (tensor / pipeline / expert / data parallelism), straggler and failure recovery, checkpoint I/O, MoE load imbalance, and FP8 kernel maturity. Reinforcement-learning pipelines incur additional cost from rollout / training alternation. <em>The reported time should be read as an optimistic floor, not a target.</em>
           </p>
         </div>
+
       </div>
     </section>
   );
@@ -1294,12 +1490,13 @@ const C = {
   textDim: '#777771',
   textMute: '#a3a39c',
   ink: '#0e0e0e',
-  accent: '#ff5b1f',     // burnt orange
-  accent2: '#1a4d3a',    // deep green
-  accent3: '#4a3aff',    // indigo
-  highlight: '#fff4d6',
+  accent: '#2c4a6e',       // slate blue (academic)
+  accentSoft: '#eef2f7',   // soft tint for active backgrounds
+  accent2: '#1a4d3a',      // deep forest green
+  accent3: '#722f37',      // muted burgundy
+  highlight: '#f4ecd8',    // parchment
   good: '#1a8055',
-  warn: '#b85c00',
+  warn: '#a8651a',
 };
 
 const display = "'Fraunces', 'Newsreader', Georgia, serif";
@@ -1357,7 +1554,9 @@ const S = {
     position: 'relative',
   },
   modeTabActive: {
-    background: C.ink, color: C.bg,
+    background: C.accentSoft, color: C.accent,
+    fontWeight: 600,
+    borderBottom: `2px solid ${C.accent}`,
   },
   modeTabIcon: {
     fontFamily: display, fontSize: 28, fontWeight: 400, fontStyle: 'italic',
@@ -1418,34 +1617,41 @@ const S = {
     minWidth: 60, textAlign: 'right',
   },
   tagAccent: {
-    fontFamily: mono, fontSize: 10, letterSpacing: '0.12em',
-    background: C.ink, color: C.bg, padding: '4px 8px', fontWeight: 600,
+    fontFamily: display, fontSize: 12, fontStyle: 'italic',
+    color: C.accent, letterSpacing: '0.04em',
+    fontVariant: 'small-caps', fontWeight: 500,
+  },
+  tagDivider: {
+    fontFamily: display, color: C.textMute, fontSize: 14,
   },
   tagDim: {
-    fontFamily: mono, fontSize: 11, color: C.textDim, letterSpacing: '0.05em',
+    fontFamily: display, fontSize: 13, color: C.textDim,
+    fontStyle: 'italic', letterSpacing: '0.01em',
   },
   title: {
     fontFamily: display,
-    fontSize: 'clamp(36px, 5.5vw, 64px)',
+    fontSize: 'clamp(40px, 6vw, 68px)',
     fontWeight: 400,
     letterSpacing: '-0.025em',
     lineHeight: 1.0,
-    margin: 0,
+    margin: '4px 0 0',
     fontStyle: 'italic',
     color: C.ink,
   },
   titleAccent: {
-    fontFamily: sans,
+    fontFamily: display,
     fontStyle: 'normal',
-    fontWeight: 300,
+    fontWeight: 400,
     color: C.accent,
-    fontSize: '0.78em',
-    marginLeft: 14,
-    letterSpacing: '-0.02em',
+    fontSize: '0.72em',
+    marginLeft: 18,
+    letterSpacing: '0.005em',
+    fontVariant: 'small-caps',
   },
   subtitle: {
-    fontFamily: sans, fontSize: 14, color: C.textMid,
-    maxWidth: 720, marginTop: 12, lineHeight: 1.55,
+    fontFamily: display, fontSize: 15, color: C.text,
+    maxWidth: 760, marginTop: 16, lineHeight: 1.65,
+    letterSpacing: '0.005em',
   },
 
   // Preset bar
@@ -1478,7 +1684,8 @@ const S = {
     cursor: 'pointer', transition: 'all 0.12s',
   },
   presetBtnActive: {
-    background: C.ink, color: C.bg, borderColor: C.ink,
+    background: C.accentSoft, color: C.accent, borderColor: C.accent,
+    fontWeight: 600,
   },
   customBadge: {
     fontFamily: mono, fontSize: 11, color: C.accent,
@@ -1587,7 +1794,8 @@ const S = {
     textAlign: 'left',
   },
   segActive: {
-    background: C.ink, color: C.bg, borderColor: C.ink,
+    background: C.accentSoft, color: C.accent, borderColor: C.accent,
+    fontWeight: 600,
   },
   segLabel: {
     fontFamily: mono, fontSize: 12, fontWeight: 600,
@@ -1608,7 +1816,8 @@ const S = {
     textAlign: 'center',
   },
   gpuSegActive: {
-    background: C.accent, color: C.bg, borderColor: C.accent,
+    background: C.accentSoft, color: C.accent, borderColor: C.accent,
+    fontWeight: 600,
   },
   precSeg: {
     flex: 1,
@@ -1620,7 +1829,8 @@ const S = {
     textAlign: 'center',
   },
   precSegActive: {
-    background: C.ink, color: C.bg, borderColor: C.ink,
+    background: C.accentSoft, color: C.accent, borderColor: C.accent,
+    fontWeight: 600,
   },
   precSegDisabled: {
     opacity: 0.35, cursor: 'not-allowed',
@@ -1635,7 +1845,8 @@ const S = {
     color: C.textDim, cursor: 'pointer',
   },
   chipActive: {
-    background: C.text, color: C.bg, borderColor: C.text,
+    background: C.accentSoft, color: C.accent, borderColor: C.accent,
+    fontWeight: 600,
   },
 
   // Toggle (iOS-style switch)
@@ -1785,6 +1996,20 @@ const S = {
     marginTop: 22, paddingTop: 18,
     borderTop: `1px dashed ${C.border}`,
   },
+  formulaToggle: {
+    display: 'flex', alignItems: 'center', gap: 8,
+    width: '100%', padding: 0, margin: 0,
+    background: 'transparent', border: 'none', cursor: 'pointer',
+    textAlign: 'left',
+  },
+  formulaCaret: {
+    fontSize: 10, color: C.textDim,
+    transition: 'transform 0.15s ease',
+    display: 'inline-block',
+  },
+  formulaToggleHint: {
+    marginLeft: 'auto', fontSize: 11, color: C.textDim,
+  },
   formulaGroup: {
     marginTop: 14, marginBottom: 10,
     paddingLeft: 12,
@@ -1842,32 +2067,76 @@ const S = {
     border: `1px solid ${C.border}`,
     marginBottom: 28,
   },
+  methodBody: {
+    padding: '20px 24px 28px',
+  },
   methodGrid: {
     display: 'grid',
     gridTemplateColumns: 'repeat(2, 1fr)',
-    gap: 32,
-    padding: '20px 24px 24px',
+    columnGap: 36,
+    rowGap: 26,
   },
   methodCol: { minWidth: 0 },
+  methodFull: {
+    marginTop: 26, paddingTop: 22,
+    borderTop: `1px dashed ${C.border}`,
+  },
   methodTitle: {
-    fontFamily: display, fontSize: 16, fontStyle: 'italic',
+    fontFamily: display, fontSize: 17, fontStyle: 'italic',
     fontWeight: 500, color: C.ink,
     marginTop: 0, marginBottom: 12,
     paddingBottom: 6,
-    borderBottom: `1px dashed ${C.border}`,
+    borderBottom: `1px solid ${C.border}`,
+    letterSpacing: '0.01em',
   },
   methodNote: {
-    fontFamily: sans, fontSize: 12, color: C.textDim,
-    fontStyle: 'italic', marginTop: 8, lineHeight: 1.5,
+    fontFamily: display, fontSize: 13, color: C.textDim,
+    fontStyle: 'italic', marginTop: 10, lineHeight: 1.55,
   },
   bullets: {
-    margin: 0, paddingLeft: 18,
-    fontFamily: sans, fontSize: 13, color: C.text,
-    lineHeight: 1.7,
+    margin: 0, paddingLeft: 20,
+    fontFamily: display, fontSize: 14, color: C.text,
+    lineHeight: 1.7, letterSpacing: '0.005em',
   },
   bodyText: {
-    fontFamily: sans, fontSize: 13, color: C.textMid,
-    lineHeight: 1.6,
+    fontFamily: display, fontSize: 14, color: C.text,
+    lineHeight: 1.7, letterSpacing: '0.005em',
+    margin: 0, textIndent: '1.5em',
+  },
+  dl: {
+    margin: 0,
+    fontFamily: display, fontSize: 14, color: C.text,
+    lineHeight: 1.55,
+    display: 'grid',
+    gridTemplateColumns: '70px 1fr',
+    columnGap: 14, rowGap: 8,
+  },
+  dt: {
+    fontFamily: sans, fontWeight: 600, fontSize: 11,
+    color: C.accent, letterSpacing: '0.08em',
+    textTransform: 'uppercase',
+    paddingTop: 3,
+  },
+  dd: {
+    margin: 0, fontFamily: display, fontSize: 14,
+    color: C.text, lineHeight: 1.55,
+  },
+  refs: {
+    margin: 0, paddingLeft: 22,
+    fontFamily: display, fontSize: 13, color: C.text,
+    lineHeight: 1.6, letterSpacing: '0.005em',
+  },
+  refAuthor: {
+    fontFamily: display, fontVariant: 'small-caps',
+    letterSpacing: '0.04em',
+    color: C.text, fontWeight: 500,
+  },
+  refTitle: {
+    fontFamily: display, fontStyle: 'italic',
+    color: C.ink,
+  },
+  refMeta: {
+    fontFamily: sans, fontSize: 12, color: C.textDim,
   },
   code: {
     fontFamily: mono, fontSize: 11,
@@ -1884,15 +2153,29 @@ const S = {
   th: {
     textAlign: 'left',
     padding: '6px 8px',
-    borderBottom: `1px solid ${C.border}`,
+    borderBottom: `1px solid ${C.borderStrong}`,
     color: C.textDim, fontWeight: 500,
-    fontSize: 10, letterSpacing: '0.06em', textTransform: 'uppercase',
+    fontSize: 10, letterSpacing: '0.08em', textTransform: 'uppercase',
+  },
+  thNum: {
+    textAlign: 'right',
+    padding: '6px 8px',
+    borderBottom: `1px solid ${C.borderStrong}`,
+    color: C.textDim, fontWeight: 500,
+    fontSize: 10, letterSpacing: '0.08em', textTransform: 'uppercase',
   },
   td: {
     padding: '6px 8px',
     borderBottom: `1px solid ${C.border}`,
     color: C.text,
     fontVariantNumeric: 'tabular-nums',
+  },
+  tdNum: {
+    padding: '6px 8px',
+    borderBottom: `1px solid ${C.border}`,
+    color: C.text,
+    fontVariantNumeric: 'tabular-nums',
+    textAlign: 'right',
   },
 
   // Footer
