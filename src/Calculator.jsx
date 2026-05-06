@@ -1434,6 +1434,61 @@ function Methodology() {
         <h2 style={S.panelTitle}>Methodology</h2>
       </div>
       <div style={S.methodBody}>
+        <div style={S.methodIntro}>
+          <h3 style={S.methodIntroTitle}>估算方法 · 中文简介</h3>
+
+          <div style={S.methodIntroGrid}>
+            <div style={S.formulaCard}>
+              <div style={S.formulaCardLabel}>核心公式</div>
+              <div style={S.formulaCardBody}>
+                <div style={S.formulaLhs}>训练时间&nbsp;=</div>
+                <div style={S.formulaFraction}>
+                  <div style={S.formulaNumLine}>每 token FLOPs × 总 tokens × 3</div>
+                  <div style={S.formulaBar} />
+                  <div style={S.formulaDenLine}>GPU 峰值 × MFU × GPU 数</div>
+                </div>
+              </div>
+              <div style={S.formulaCardFoot}>
+                上 = 分子（总计算量），下 = 分母（实际算力）。
+              </div>
+            </div>
+
+            <div style={S.methodCards}>
+              <div style={S.methodCard}>
+                <div style={S.methodCardNum}>分子&nbsp;·&nbsp;总计算量</div>
+                <div style={S.methodCardTitle}>每 token FLOPs × 总 tokens × 3</div>
+                <ul style={S.methodCardList}>
+                  <li>按模型结构（hidden_size、layers、注意力类型 MHA / GQA / MLA / Linear+Full、MoE 专家数）逐层算 forward FLOPs</li>
+                  <li>训练 ≈ <strong>3 × forward</strong>（forward + backward；开激活重算则 4 ×）</li>
+                  <li>乘以训练 token 总量（如 30T）→ 总计算量量级 10²⁴ FLOPs</li>
+                </ul>
+              </div>
+
+              <div style={S.methodCard}>
+                <div style={S.methodCardNum}>分母&nbsp;·&nbsp;实际算力</div>
+                <div style={S.methodCardTitle}>GPU 峰值 × MFU × GPU 数</div>
+                <ul style={S.methodCardList}>
+                  <li>单卡峰值：B300 FP8 = 7,000 TFLOPS / B200 = 4,500 / H100 = 1,979</li>
+                  <li><strong>MFU（真实利用率）</strong>：受互联、kernel、batch、seq 长度影响</li>
+                  <li>MFU 取自 NVIDIA NeMo Megatron-Bridge 实测：<strong>B300 standalone = 12%（4K 卡 ~10%）</strong>，按 GPU + 模型类型 + 集群规模自动填入</li>
+                </ul>
+              </div>
+            </div>
+          </div>
+
+          <div style={S.methodCaveat}>
+            <span style={S.methodCaveatLabel}>注意</span>
+            算出的是<strong>理想训练时间</strong>（乐观下限）。实际生产因通信、stragglers、
+            checkpoint、kernel 切换、调参重启等再 +10–30%。对外报排期建议在此基础上 <strong>× 1.3–1.5</strong>。
+          </div>
+
+          <p style={S.methodIntroFootnote}>
+            FLOPs 公式与 DeepSeek-V3 论文对齐到 0.05pp；MFU 数字来自{' '}
+            <a href="https://docs.nvidia.com/nemo/megatron-bridge/latest/performance-summary.html" target="_blank" rel="noreferrer" style={S.methodLink}>NVIDIA NeMo Megatron-Bridge Performance Summary</a>；
+            所有公式可在下方 <em>Per-component formulas</em> 展开逐项核对。
+          </p>
+        </div>
+
         <div style={S.methodGrid}>
           <div style={S.methodCol}>
             <h3 style={S.methodTitle}>FLOPs accounting</h3>
@@ -2137,6 +2192,114 @@ const S = {
   methodFull: {
     marginTop: 26, paddingTop: 22,
     borderTop: `1px dashed ${C.border}`,
+  },
+  methodIntro: {
+    marginBottom: 32, paddingBottom: 30,
+    borderBottom: `1px dashed ${C.border}`,
+  },
+  methodIntroTitle: {
+    fontFamily: display, fontSize: 22, fontStyle: 'italic',
+    fontWeight: 500, color: C.ink,
+    marginTop: 0, marginBottom: 18,
+    letterSpacing: '0.005em',
+  },
+  methodIntroGrid: {
+    display: 'grid',
+    gridTemplateColumns: '1fr 1.4fr',
+    gap: 24,
+    alignItems: 'stretch',
+  },
+  formulaCard: {
+    background: C.accentSoft,
+    borderLeft: `4px solid ${C.accent}`,
+    padding: '20px 22px',
+    display: 'flex', flexDirection: 'column',
+  },
+  formulaCardLabel: {
+    fontFamily: sans, fontSize: 11, color: C.accent,
+    letterSpacing: '0.14em', textTransform: 'uppercase',
+    fontWeight: 600, marginBottom: 16,
+  },
+  formulaCardBody: {
+    flex: 1,
+    display: 'flex', alignItems: 'center', justifyContent: 'center',
+    gap: 14, padding: '12px 0',
+  },
+  formulaLhs: {
+    fontFamily: display, fontSize: 19, fontStyle: 'italic',
+    color: C.ink, whiteSpace: 'nowrap',
+  },
+  formulaFraction: {
+    display: 'flex', flexDirection: 'column',
+    alignItems: 'center', gap: 6,
+  },
+  formulaNumLine: {
+    fontFamily: display, fontSize: 16, color: C.ink,
+    letterSpacing: '0.005em', padding: '0 6px',
+    textAlign: 'center',
+  },
+  formulaBar: {
+    height: 2, background: C.accent, width: '100%',
+    minWidth: 280,
+  },
+  formulaDenLine: {
+    fontFamily: display, fontSize: 16, color: C.ink,
+    letterSpacing: '0.005em', padding: '0 6px',
+    textAlign: 'center',
+  },
+  formulaCardFoot: {
+    fontFamily: display, fontSize: 12.5, fontStyle: 'italic',
+    color: C.textDim, marginTop: 14,
+    paddingTop: 12, borderTop: `1px dashed ${C.borderStrong}`,
+    textAlign: 'center',
+  },
+  methodCards: {
+    display: 'flex', flexDirection: 'column',
+    gap: 14,
+  },
+  methodCard: {
+    background: C.panel2,
+    padding: '16px 20px',
+    border: `1px solid ${C.border}`,
+  },
+  methodCardNum: {
+    fontFamily: sans, fontSize: 11, color: C.accent,
+    letterSpacing: '0.12em', textTransform: 'uppercase',
+    fontWeight: 600, marginBottom: 4,
+  },
+  methodCardTitle: {
+    fontFamily: mono, fontSize: 13, color: C.ink,
+    fontWeight: 600,
+    marginBottom: 10, letterSpacing: '0.01em',
+    paddingBottom: 8, borderBottom: `1px dashed ${C.border}`,
+  },
+  methodCardList: {
+    margin: 0, paddingLeft: 18,
+    fontFamily: display, fontSize: 14.5, color: C.text,
+    lineHeight: 1.65, letterSpacing: '0.005em',
+  },
+  methodCaveat: {
+    margin: '20px 0 0',
+    padding: '12px 16px',
+    background: C.highlight,
+    borderLeft: `3px solid ${C.warn}`,
+    fontFamily: display, fontSize: 14, color: C.text,
+    lineHeight: 1.6, letterSpacing: '0.005em',
+  },
+  methodCaveatLabel: {
+    fontFamily: sans, fontSize: 11, color: C.warn,
+    fontWeight: 700, letterSpacing: '0.12em',
+    textTransform: 'uppercase',
+    marginRight: 10,
+  },
+  methodIntroFootnote: {
+    fontFamily: display, fontSize: 13.5, color: C.textDim,
+    fontStyle: 'italic', margin: '14px 0 0',
+    lineHeight: 1.6,
+  },
+  methodLink: {
+    color: C.accent, textDecoration: 'underline',
+    textDecorationStyle: 'dotted', textDecorationColor: C.borderStrong,
   },
   methodTitle: {
     fontFamily: display, fontSize: 17, fontStyle: 'italic',
